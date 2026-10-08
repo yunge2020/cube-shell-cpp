@@ -16,6 +16,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QDebug>
+#include <QFile>
 #include <QList>
 #include <QMenu>
 #include <QPoint>
@@ -25,6 +26,10 @@
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 
+#include <functional>
+
+#include "config/GlobalState.h"
+#include "config/GroupManager.h"
 #include "device_list_widget.h"
 
 using namespace cubeshell;
@@ -39,6 +44,7 @@ static QStringList g_removeNames;
 static bool g_removeEmitted = false;
 static bool g_actionFound = false;
 static bool g_popupSeen = false;
+static bool g_moveMenuOk = false;
 
 static DeviceEntry makeDevice(const QString &name)
 {
@@ -59,6 +65,19 @@ static QTreeWidgetItem *deviceItem(QTreeWidget *tree, const QString &name)
             if (root->child(j)->text(0) == name)
                 return root->child(j);
         }
+    }
+    return nullptr;
+}
+
+// 多级分组下设备可能嵌在第任意层，递归找。
+static QTreeWidgetItem *findDeep(QTreeWidgetItem *parent, const QString &text)
+{
+    for (int i = 0; i < parent->childCount(); ++i) {
+        QTreeWidgetItem *child = parent->child(i);
+        if (child->text(0) == text)
+            return child;
+        if (QTreeWidgetItem *deep = findDeep(child, text))
+            return deep;
     }
     return nullptr;
 }
@@ -110,6 +129,9 @@ int main(int argc, char **argv)
     // 隔离配置目录：DeviceListWidget 默认构造的 GroupManager 读的是真实
     // groups.json，测试不能碰用户的分组文件。必须在任何 configDir() 之前设。
     QStandardPaths::setTestModeEnabled(true);
+    // 测试目录跨轮次持久：上一轮分组用例留下的 groups.json（dev-a 已入组）
+    // 会让第一段"全部未分组"的断言悬空。GroupManager 每次操作都读盘，先清场。
+    QFile::remove(GlobalState::groupsConfigPath());
     QApplication app(argc, argv);
 
     DeviceListWidget widget;
@@ -186,6 +208,118 @@ int main(int argc, char **argv)
     openMenuOn(&widget, tree, a, /*trigger=*/false);
     CHECK(g_actionFound);
     CHECK(!g_removeEmitted);
+
+    // ---------------------------------------------------------------------
+    // 多级分组渲染：子分组嵌在父分组节点下，设备挂在各自分组，"未分组"最后。
+    // GroupManager 每次操作都重读文件，用默认路径（test mode 已隔离）直接造。
+    {
+        GroupManager groups;
+        CHECK(groups.createGroup(QStringLiteral("顶层组")));
+        CHECK(groups.createGroup(QStringLiteral("子组"), QStringLiteral("顶层组")));
+        // 分组以完整路径定位（裸名"子组"已不是合法分组路径）。
+        groups.moveDeviceToGroup(QStringLiteral("dev-a"), QStringLiteral("顶层组/子组"));
+        widget.setDevices(devices);
+        QApplication::processEvents();
+
+        // 顶层：顶层组 + 未分组（dev-b/c/d 仍未分组）。
+        CHECK(tree->topLevelItemCount() == 2);
+        QTreeWidgetItem *top = tree->topLevelItem(0);
+        CHECK(top && top->text(0) == QStringLiteral("顶层组"));
+        // 类型 role 与控件内部约定一致：UserRole+1 = "group"/"device"。
+        CHECK(top->data(0, Qt::UserRole + 1).toString() == QStringLiteral("group"));
+        // 子组嵌套在顶层组下，同样拿分组字体（递归渲染别丢了样式）。
+        CHECK(top->childCount() == 1);
+        QTreeWidgetItem *sub = top->childCount() ? top->child(0) : nullptr;
+        CHECK(sub && sub->text(0) == QStringLiteral("子组"));
+        CHECK(sub && sub->data(0, Qt::UserRole + 1).toString() == QStringLiteral("group"));
+        CHECK(sub && sub->font(0).bold());
+        // dev-a 现在嵌在第三层。
+        QTreeWidgetItem *devA = sub ? findDeep(top, QStringLiteral("dev-a")) : nullptr;
+        CHECK(devA && devA->parent() == sub);
+        CHECK(devA && devA->data(0, Qt::UserRole + 1).toString() == QStringLiteral("device"));
+        // 未分组根在最后，dev-b/c/d 仍是它的直接子节点。
+        QTreeWidgetItem *ungroupedRoot = tree->topLevelItem(1);
+        CHECK(ungroupedRoot && ungroupedRoot->text(0) == QStringLiteral("未分组"));
+        CHECK(ungroupedRoot && ungroupedRoot->childCount() == 3);
+
+        // 「移到分组」菜单按层级展开：带子分组的顶层组折叠成子菜单，首项
+        // "移到「顶层组」"指向该组自己，其后是它的子分组（叶子直接动作）。
+        QTreeWidgetItem *b2 = deviceItem(tree, QStringLiteral("dev-b"));
+        CHECK(b2 != nullptr);
+        QTimer::singleShot(0, &widget, []() {
+            QMenu *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+            if (!menu)
+                return;
+            for (QAction *act : menu->actions()) {
+                if (!act->text().startsWith(QStringLiteral("移到分组")) || !act->menu())
+                    continue;
+                QMenu *moveMenu = act->menu();
+                // 顶层组带子分组 → 折叠成子菜单；"未分组"不是真分组，不进菜单。
+                QMenu *topMenu = nullptr;
+                for (QAction *entry : moveMenu->actions()) {
+                    if (entry->menu()
+                            && entry->menu()->title() == QStringLiteral("顶层组"))
+                        topMenu = entry->menu();
+                }
+                if (!topMenu)
+                    return;
+                QStringList texts;
+                for (QAction *a2 : topMenu->actions())
+                    if (!a2->text().isEmpty() && !a2->isSeparator())
+                        texts << a2->text();
+                g_moveMenuOk = (texts == QStringList{QStringLiteral("移到「顶层组」"),
+                                                     QStringLiteral("子组")});
+                return;
+            }
+        });
+        openMenuOn(&widget, tree, b2, /*trigger=*/false);
+        CHECK(g_moveMenuOk);
+    }
+
+    // ---------------------------------------------------------------------
+    // 同名分组：不同父分组下允许同名子分组（本修复的核心语义）。两棵子树
+    // 渲染互不串桶，设备挂在正确的孪生节点下（kPathRole 各自持有完整路径）。
+    {
+        // 上一块留下的 groups.json（顶层组/子组）会混进本块的树，先清场。
+        QFile::remove(GlobalState::groupsConfigPath());
+        GroupManager groups;
+        CHECK(groups.createGroup(QStringLiteral("华东")));
+        CHECK(groups.createGroup(QStringLiteral("上海"), QStringLiteral("华东")));
+        CHECK(groups.createGroup(QStringLiteral("浦东"), QStringLiteral("华东/上海")));
+        CHECK(groups.createGroup(QStringLiteral("苏州")));
+        CHECK(groups.createGroup(QStringLiteral("浦东"), QStringLiteral("苏州")));
+        groups.moveDeviceToGroup(QStringLiteral("dev-a"), QStringLiteral("华东/上海/浦东"));
+        groups.moveDeviceToGroup(QStringLiteral("dev-b"), QStringLiteral("苏州/浦东"));
+        widget.setDevices(devices);
+        QApplication::processEvents();
+
+        // 顶层：华东、苏州、未分组。
+        CHECK(tree->topLevelItemCount() == 3);
+        QTreeWidgetItem *east = nullptr;
+        QTreeWidgetItem *west = nullptr;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i) {
+            QTreeWidgetItem *top = tree->topLevelItem(i);
+            if (top->data(0, Qt::UserRole + 2).toString() == QStringLiteral("华东"))
+                east = top;
+            else if (top->data(0, Qt::UserRole + 2).toString() == QStringLiteral("苏州"))
+                west = top;
+        }
+        CHECK(east && west);
+        // 两个"浦东"都在：显示名相同（叶子名），kPathRole 各自持有完整路径。
+        QTreeWidgetItem *puDong1 = east ? findDeep(east, QStringLiteral("浦东")) : nullptr;
+        QTreeWidgetItem *puDong2 = west ? findDeep(west, QStringLiteral("浦东")) : nullptr;
+        CHECK(puDong1 && puDong1->data(0, Qt::UserRole + 2).toString()
+                  == QStringLiteral("华东/上海/浦东"));
+        CHECK(puDong2 && puDong2->data(0, Qt::UserRole + 2).toString()
+                  == QStringLiteral("苏州/浦东"));
+        CHECK(puDong1 && puDong1->text(0) == QStringLiteral("浦东"));
+        CHECK(puDong2 && puDong2->text(0) == QStringLiteral("浦东"));
+        // 设备挂在正确的孪生节点下，互不串桶。
+        CHECK(puDong1 && findDeep(puDong1, QStringLiteral("dev-a")) != nullptr);
+        CHECK(puDong2 && findDeep(puDong2, QStringLiteral("dev-b")) != nullptr);
+        CHECK(puDong1 && findDeep(puDong1, QStringLiteral("dev-b")) == nullptr);
+        CHECK(puDong2 && findDeep(puDong2, QStringLiteral("dev-a")) == nullptr);
+    }
 
     if (failures == 0)
         qInfo() << "device_list_test: all checks passed";

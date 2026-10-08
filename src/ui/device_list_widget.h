@@ -2,16 +2,22 @@
 
 // DeviceListWidget.h — device/connection list panel (vertical slice).
 //
-// Shows the saved devices grouped by GroupManager (root nodes = groups,
-// children = devices), mirroring cube-shell.py's treeWidget + treeRight()
-// context menu. Emits activated() when the user double-clicks a device:
-//   device list -> double-click -> SSH connect -> terminal tab.
+// Shows the saved devices grouped by GroupManager (group nodes nest to
+// arbitrary depth; groups are identified by full path so same-named
+// sub-groups can exist under different parents; device nodes hang under
+// their group; the "__ungrouped__" node stays last), mirroring
+// cube-shell.py's treeWidget + treeRight() context menu. Emits activated()
+// when the user double-clicks a device: device list -> double-click ->
+// SSH connect -> terminal tab.
 // Also hosts the follow_folder / remote_monitoring checkboxes shown at the
 // bottom of the left panel in the Python UI.
 
 #include <QElapsedTimer>
+#include <QSet>
 #include <QStringList>
 #include <QWidget>
+
+#include <functional>
 
 #include "config/DeviceConfigStore.h"
 #include "config/GroupManager.h"
@@ -20,6 +26,7 @@ class QTreeWidget;
 class QTreeWidgetItem;
 class QLabel;
 class QCheckBox;
+class QMenu;
 
 namespace cubeshell {
 
@@ -72,16 +79,31 @@ private slots:
     void onContextMenu(const QPoint &pos);
 
 private:
-    // Rebuild the tree from m_devices + GroupManager::groupedDevices().
+    // Rebuild the tree from m_devices + GroupManager（多级分组递归渲染）.
     void rebuildTree();
     // 按当前 m_fontSize 重设已有节点的字体（不重建树，保留展开状态）。
     void applyFonts();
     // 让树图标尺寸随 m_fontSize 走（鸿蒙高密度屏默认样式图标偏小的修复）。
     void updateIconSize();
+    // 分组节点工厂：文案/图标/role 一处拼装（顶层与嵌套层共用）。
+    // display 是叶子显示名；path 是完整路径（kPathRole，同名分组的唯一区分）。
+    QTreeWidgetItem *createGroupItem(const QString &display, const QString &path);
+    // 把一组设备节点挂到分组节点下（图标按协议、tooltip 按 nickname）。
+    void appendDeviceItems(QTreeWidgetItem *groupItem, const QStringList &deviceNames,
+                           const QHash<QString, const DeviceEntry *> &byName);
+    // 把 parentPath 下的分组子树填进 menu：叶子是直接动作，有子分组的组
+    // 变成子菜单（首项"移到「组名」"指向该组自己）。分组以完整路径标识
+    // （onPick 收到路径）。excluded 里的分组不出现（移动分组时用来排除
+    // 自己与后代，防成环）。
+    void fillMoveMenu(QMenu *menu, const GroupData &data, const QString &parentPath,
+                      const QSet<QString> &excluded,
+                      const std::function<void(const QString &)> &onPick);
     // 对应Python: _create_new_group / _rename_group / _delete_group
-    void createGroup();
-    void renameGroup(const QString &oldName);
-    void deleteGroup(const QString &name);
+    // parentPath 非空 = 在该分组下新建子分组；空 = 顶层分组。查重是同级的。
+    void createGroup(const QString &parentPath = QString());
+    // oldPath 为被重命名分组的完整路径；newName 为新的叶子显示名。
+    void renameGroup(const QString &oldPath);
+    void deleteGroup(const QString &path);
 
     QTreeWidget *m_tree = nullptr;
     QLabel *m_status = nullptr;

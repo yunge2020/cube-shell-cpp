@@ -1,5 +1,7 @@
 #include "device_list_widget.h"
 
+#include <algorithm>
+
 #include <QCheckBox>
 #include <QFont>
 #include <QHBoxLayout>
@@ -19,8 +21,10 @@
 namespace cubeshell {
 
 // Item payload roles. 对应Python: item.setData(0, Qt.UserRole, "group"/"device")
-static constexpr int kNameRole = Qt::UserRole;      // device name / group name
+static constexpr int kNameRole = Qt::UserRole;      // device name / group leaf name
 static constexpr int kTypeRole = Qt::UserRole + 1;  // "group" | "device"
+// 分组的完整路径（同名分组靠它区分；kUngrouped 节点也是它）。
+static constexpr int kPathRole = Qt::UserRole + 2;
 
 static const QLatin1String kTypeGroup("group");
 static const QLatin1String kTypeDevice("device");
@@ -239,13 +243,12 @@ void DeviceListWidget::onContextMenu(const QPoint &pos)
                                            ? tr("移到分组（%1 项）").arg(names.size())
                                            : tr("移到分组"));
         const GroupData data = m_groups.loadGroups();
-        for (const QString &group : data.groups) {
-            moveMenu->addAction(group, this, [this, names, group]() {
-                for (const QString &n : names)
-                    m_groups.moveDeviceToGroup(n, group);
-                rebuildTree();
-            });
-        }
+        // 多级分组：目标菜单按层级展开，子分组折叠进各自父分组的子菜单里。
+        fillMoveMenu(moveMenu, data, QString(), {}, [this, names](const QString &group) {
+            for (const QString &n : names)
+                m_groups.moveDeviceToGroup(n, group);
+            rebuildTree();
+        });
         if (!data.groups.isEmpty())
             moveMenu->addSeparator();
         moveMenu->addAction(tr("移出分组"), this, [this, names]() {
@@ -254,19 +257,45 @@ void DeviceListWidget::onContextMenu(const QPoint &pos)
             rebuildTree();
         });
     } else if (type == kTypeGroup) {
-        // 分组节点：重命名 / 删除分组（"未分组"不允许）/ 新建子设备 / 新建分组
-        const bool ungrouped = (name == GroupManager::kUngrouped);
+        // 分组节点：重命名 / 删除分组 / 新建子分组 / 移动分组（"未分组"不允许）。
+        // 分组操作一律用 kPathRole 里的完整路径定位——同名分组全靠它区分。
+        const QString path = item ? item->data(0, kPathRole).toString() : QString();
+        const bool ungrouped = (path == GroupManager::kUngrouped);
         if (!ungrouped) {
-            menu.addAction(tr("重命名分组"), this, [this, name]() { renameGroup(name); });
-            menu.addAction(tr("删除分组"), this, [this, name]() { deleteGroup(name); });
+            menu.addAction(tr("重命名分组"), this, [this, path]() { renameGroup(path); });
+            menu.addAction(tr("删除分组"), this, [this, path]() { deleteGroup(path); });
+            menu.addAction(tr("新建子分组"), this, [this, path]() { createGroup(path); });
+            // 移动分组到...：排除自己与全部后代，否则会挂出环。
+            const GroupData data = m_groups.loadGroups();
+            QSet<QString> excluded;
+            excluded.insert(path);
+            for (const QString &desc : GroupManager::descendants(data, path))
+                excluded.insert(desc);
+            const bool hasCandidates =
+                std::any_of(data.groups.cbegin(), data.groups.cend(),
+                            [&excluded](const QString &g) { return !excluded.contains(g); });
+            if (hasCandidates) {
+                QMenu *moveMenu = menu.addMenu(tr("移动分组到"));
+                fillMoveMenu(moveMenu, data, QString(), excluded,
+                             [this, path](const QString &target) {
+                                 m_groups.setGroupParent(path, target);
+                                 rebuildTree();
+                             });
+                moveMenu->addSeparator();
+                moveMenu->addAction(tr("移到顶层"), this, [this, path]() {
+                    m_groups.setGroupParent(path, QString());
+                    rebuildTree();
+                });
+            }
             menu.addSeparator();
         }
         menu.addAction(tr("添加配置"), this, &DeviceListWidget::addRequested);
-        menu.addAction(tr("新建分组"), this, &DeviceListWidget::createGroup);
+        // createGroup 带 QString 默认参数，成员指针与 triggered(bool) 不匹配，需用 lambda 收敛。
+        menu.addAction(tr("新建分组"), this, [this] { createGroup(); });
     } else {
         // 空白区域：新建分组 / 新建设备 / 本机终端 / 保存
         menu.addAction(tr("添加配置"), this, &DeviceListWidget::addRequested);
-        menu.addAction(tr("新建分组"), this, &DeviceListWidget::createGroup);
+        menu.addAction(tr("新建分组"), this, [this] { createGroup(); });
         menu.addSeparator();
 #ifdef CUBESHELL_WITH_LOCALPTY
         // 鸿蒙：无本地 shell，「新建本机终端」入口摘除。
@@ -285,7 +314,55 @@ void DeviceListWidget::setDevices(const QList<DeviceEntry> &devices)
     rebuildTree();
 }
 
-// 对应Python: refreshConf 里按 get_grouped_devices 组装 treeWidget
+// 分组节点工厂：顶层与嵌套层共用一套文案/图标/role 拼装。
+// display 是叶子显示名；path 是完整路径（kPathRole），同名分组全靠它区分。
+QTreeWidgetItem *DeviceListWidget::createGroupItem(const QString &display, const QString &path)
+{
+    auto *item = new QTreeWidgetItem;
+    item->setText(0, display);
+    item->setFont(0, groupFont(m_fontSize));
+    // 分组用系统文件夹图标。对应Python: style().standardIcon(SP_DirIcon)
+    item->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
+    item->setData(0, kNameRole, GroupManager::leafName(path));
+    item->setData(0, kTypeRole, QString(kTypeGroup));
+    item->setData(0, kPathRole, path);
+    return item;
+}
+
+void DeviceListWidget::appendDeviceItems(
+    QTreeWidgetItem *groupItem, const QStringList &deviceNames,
+    const QHash<QString, const DeviceEntry *> &byName)
+{
+    for (const QString &deviceName : deviceNames) {
+        const DeviceEntry *d = byName.value(deviceName);
+        if (!d)
+            continue;
+        auto *item = new QTreeWidgetItem(groupItem);
+        item->setText(0, d->name);
+        item->setFont(0, deviceFont(m_fontSize));
+        // 对应Python: cube-shell.py:3966-3994 — RDP 设备用 Windows 图标，
+        // Serial 设备用 icons8-serial-48.png，SSH 设备用 icons8-ssh-48.png
+        // Telnet/TCP 各有自己的图标；两者必须排在 SSH 兜底分支之前判断。
+        if (d->isRdp())
+            item->setIcon(0, QIcon(QStringLiteral(":/icons8-windows-48.png")));
+        else if (d->isSerial())
+            item->setIcon(0, QIcon(QStringLiteral(":/icons8-serial-48.png")));
+        else if (d->isTelnet())
+            item->setIcon(0, QIcon(QStringLiteral(":/icons8-telnet-48.png")));
+        else if (d->isTcp())
+            item->setIcon(0, QIcon(QStringLiteral(":/icons8-tcp-48.png")));
+        else
+            item->setIcon(0, QIcon(QStringLiteral(":/icons8-ssh-48.png")));
+        item->setToolTip(0, deviceTooltip(*d));
+        item->setData(0, kNameRole, d->name);
+        item->setData(0, kTypeRole, QString(kTypeDevice));
+    }
+}
+
+// 对应Python: refreshConf 里按 get_grouped_devices 组装 treeWidget。
+// 多级版：分组以完整路径为标识（同名分组靠路径区分），先由 effectiveParent
+// 建出父->子索引，再从顶层分组深度优先整棵渲染；设备照旧挂在各自分组下，
+// "未分组"最后。分组节点显示叶子名，设备/菜单操作全部走 kPathRole 路径。
 void DeviceListWidget::rebuildTree()
 {
     m_tree->clear();
@@ -297,40 +374,43 @@ void DeviceListWidget::rebuildTree()
         byName.insert(d.name, &d);
     }
 
+    const GroupData data = m_groups.loadGroups();
+
+    // 平铺桶：分组路径 -> 设备名列表。groupedDevices 负责解析设备归属
+    // （未知/歧义引用回落未分组）。
+    QHash<QString, QStringList> devicesOf;
     const QList<GroupedDevices> grouped = m_groups.groupedDevices(names);
-    for (const GroupedDevices &g : grouped) {
-        const bool ungrouped = (g.group == GroupManager::kUngrouped);
-        auto *root = new QTreeWidgetItem(m_tree);
-        root->setText(0, ungrouped ? tr("未分组") : g.group);
-        root->setFont(0, groupFont(m_fontSize));
-        // 分组用系统文件夹图标。对应Python: style().standardIcon(SP_DirIcon)
-        root->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
-        root->setData(0, kNameRole, g.group);
-        root->setData(0, kTypeRole, QString(kTypeGroup));
-        for (const QString &deviceName : g.devices) {
-            const DeviceEntry *d = byName.value(deviceName);
-            if (!d)
-                continue;
-            auto *item = new QTreeWidgetItem(root);
-            item->setText(0, d->name);
-            item->setFont(0, deviceFont(m_fontSize));
-            // 对应Python: cube-shell.py:3966-3994 — RDP 设备用 Windows 图标，
-            // Serial 设备用 icons8-serial-48.png，SSH 设备用 icons8-ssh-48.png
-            // Telnet/TCP 各有自己的图标；两者必须排在 SSH 兜底分支之前判断。
-            if (d->isRdp())
-                item->setIcon(0, QIcon(QStringLiteral(":/icons8-windows-48.png")));
-            else if (d->isSerial())
-                item->setIcon(0, QIcon(QStringLiteral(":/icons8-serial-48.png")));
-            else if (d->isTelnet())
-                item->setIcon(0, QIcon(QStringLiteral(":/icons8-telnet-48.png")));
-            else if (d->isTcp())
-                item->setIcon(0, QIcon(QStringLiteral(":/icons8-tcp-48.png")));
+    devicesOf.reserve(grouped.size());
+    for (const GroupedDevices &g : grouped)
+        devicesOf.insert(g.group, g.devices);
+
+    // 父路径 -> 子路径索引（键为空串 = 顶层），保持 groups 声明顺序。
+    QHash<QString, QStringList> childrenOf;
+    childrenOf.reserve(data.groups.size());
+    for (const QString &path : data.groups)
+        childrenOf[GroupManager::effectiveParent(data, path)].append(path);
+
+    std::function<void(QTreeWidgetItem *, const QString &)> addGroup =
+        [&](QTreeWidgetItem *parentItem, const QString &path) {
+            QTreeWidgetItem *item =
+                createGroupItem(GroupManager::leafName(path), path);
+            if (parentItem)
+                parentItem->addChild(item);
             else
-                item->setIcon(0, QIcon(QStringLiteral(":/icons8-ssh-48.png")));
-            item->setToolTip(0, deviceTooltip(*d));
-            item->setData(0, kNameRole, d->name);
-            item->setData(0, kTypeRole, QString(kTypeDevice));
-        }
+                m_tree->addTopLevelItem(item);
+            for (const QString &child : childrenOf.value(path))
+                addGroup(item, child);
+            appendDeviceItems(item, devicesOf.value(path), byName);
+        };
+    for (const QString &root : childrenOf.value(QString()))
+        addGroup(nullptr, root);
+
+    // "未分组"固定最后，且仅在确有未分组设备时出现（与旧版一致）。
+    const QStringList ungroupedDevices = devicesOf.value(GroupManager::kUngrouped);
+    if (!ungroupedDevices.isEmpty()) {
+        QTreeWidgetItem *root = createGroupItem(tr("未分组"), GroupManager::kUngrouped);
+        m_tree->addTopLevelItem(root);
+        appendDeviceItems(root, ungroupedDevices, byName);
     }
     m_tree->expandAll();
 }
@@ -346,13 +426,57 @@ void DeviceListWidget::setFontSize(int pointSize)
 
 void DeviceListWidget::applyFonts()
 {
-    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
-        QTreeWidgetItem *root = m_tree->topLevelItem(i);
-        root->setFont(0, groupFont(m_fontSize));
-        for (int j = 0; j < root->childCount(); ++j)
-            root->child(j)->setFont(0, deviceFont(m_fontSize));
-    }
+    // 多级分组：按节点类型递归设字体（分组粗体 / 设备常规），层数不限。
+    std::function<void(QTreeWidgetItem *)> apply = [&](QTreeWidgetItem *item) {
+        const bool group = item->data(0, kTypeRole).toString() == kTypeGroup;
+        item->setFont(0, group ? groupFont(m_fontSize) : deviceFont(m_fontSize));
+        for (int i = 0; i < item->childCount(); ++i)
+            apply(item->child(i));
+    };
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i)
+        apply(m_tree->topLevelItem(i));
     updateIconSize();
+}
+
+// 把 parentPath 下的分组子树填进 menu。叶子分组是直接动作；有子分组的组
+// 变成子菜单——QMenu 同一项没法既触发又展开，所以首项放"移到「组名」"
+// 指向该组自己，后面跟它的子分组。分组以完整路径标识（onPick 收到路径）；
+// 菜单文案用叶子名，叶子名有同名分组时显示完整路径以示区分。
+void DeviceListWidget::fillMoveMenu(QMenu *menu, const GroupData &data,
+                                    const QString &parentPath,
+                                    const QSet<QString> &excluded,
+                                    const std::function<void(const QString &)> &onPick)
+{
+    // 叶子名出现次数：同名时菜单文案用完整路径，避免两个"浦东"分不清。
+    QHash<QString, int> leafCount;
+    for (const QString &p : data.groups)
+        leafCount[GroupManager::leafName(p)]++;
+    auto label = [&leafCount](const QString &path) {
+        const QString leaf = GroupManager::leafName(path);
+        return leafCount.value(leaf) > 1 ? path : leaf;
+    };
+
+    for (const QString &path : data.groups) {
+        if (GroupManager::effectiveParent(data, path) != parentPath)
+            continue;
+        if (excluded.contains(path))
+            continue;
+        QStringList children;
+        for (const QString &child : data.groups) {
+            if (GroupManager::effectiveParent(data, child) == path
+                    && !excluded.contains(child))
+                children.append(child);
+        }
+        if (children.isEmpty()) {
+            menu->addAction(label(path), menu, [onPick, path]() { onPick(path); });
+        } else {
+            QMenu *sub = menu->addMenu(label(path));
+            sub->addAction(tr("移到「%1」").arg(label(path)), sub,
+                           [onPick, path]() { onPick(path); });
+            sub->addSeparator();
+            fillMoveMenu(sub, data, path, excluded, onPick);
+        }
+    }
 }
 
 // 图标边长随字号走：pt → 逻辑像素按 ×96/72（14pt ≈ 19px）。显式尺寸在鸿蒙高密度
@@ -387,40 +511,58 @@ void DeviceListWidget::onItemActivated(QTreeWidgetItem *item, int /*column*/)
 // 分组操作。对应Python: _create_new_group / _rename_group / _delete_group
 // ---------------------------------------------------------------------------
 
-void DeviceListWidget::createGroup()
+// parentPath 非空 = 在该分组下新建子分组（右键分组节点入口）；空 = 顶层分组。
+// 查重是同级的：不同分组下允许同名子分组。
+void DeviceListWidget::createGroup(const QString &parentPath)
 {
-    const QString name = QInputDialog::getText(this, tr("新建分组"), tr("请输入分组名称"));
-    if (name.trimmed().isEmpty())
+    const QString title =
+        parentPath.isEmpty()
+            ? tr("新建分组")
+            : tr("新建子分组（%1）").arg(GroupManager::leafName(parentPath));
+    const QString name = QInputDialog::getText(this, title, tr("请输入分组名称"));
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty())
         return;
-    if (!m_groups.createGroup(name.trimmed())) {
-        QMessageBox::warning(this, tr("警告"), tr("分组已存在"));
+    if (trimmed.contains(QLatin1Char('/'))) {
+        QMessageBox::warning(this, tr("警告"), tr("分组名不能包含 /"));
+        return;
+    }
+    if (!m_groups.createGroup(trimmed, parentPath)) {
+        QMessageBox::warning(this, tr("警告"), tr("同级已存在同名分组"));
         return;
     }
     rebuildTree();
 }
 
-void DeviceListWidget::renameGroup(const QString &oldName)
+// oldPath 是被重命名分组的完整路径；newName 是新的叶子显示名。
+void DeviceListWidget::renameGroup(const QString &oldPath)
 {
     const QString newName = QInputDialog::getText(
-        this, tr("重命名分组"), tr("请输入分组名称"), QLineEdit::Normal, oldName);
+        this, tr("重命名分组"), tr("请输入分组名称"), QLineEdit::Normal,
+        GroupManager::leafName(oldPath));
     const QString trimmed = newName.trimmed();
-    if (trimmed.isEmpty() || trimmed == oldName)
+    if (trimmed.isEmpty() || trimmed == GroupManager::leafName(oldPath))
         return;
-    if (!m_groups.renameGroup(oldName, trimmed)) {
-        QMessageBox::warning(this, tr("警告"), tr("分组已存在"));
+    if (trimmed.contains(QLatin1Char('/'))) {
+        QMessageBox::warning(this, tr("警告"), tr("分组名不能包含 /"));
+        return;
+    }
+    if (!m_groups.renameGroup(oldPath, trimmed)) {
+        QMessageBox::warning(this, tr("警告"), tr("同级已存在同名分组"));
         return;
     }
     rebuildTree();
 }
 
-void DeviceListWidget::deleteGroup(const QString &name)
+void DeviceListWidget::deleteGroup(const QString &path)
 {
     if (QMessageBox::question(this, tr("确认删除"),
                               tr("确定要删除分组吗？") + QLatin1Char('\n')
-                                  + tr("分组内的设备将移至未分组"))
+                                  + tr("子分组将上移一级，组内设备将移至其上级分组"
+                                       "（无上级则移至未分组）"))
             != QMessageBox::Yes)
         return;
-    m_groups.deleteGroup(name);
+    m_groups.deleteGroup(path);
     rebuildTree();
 }
 
