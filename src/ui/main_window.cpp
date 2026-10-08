@@ -464,7 +464,10 @@ void MainWindow::setupMenus()
 
     // --- 文件 ---
     QMenu *fileMenu = menuBar()->addMenu(tr("文件"));
-    QAction *addDev = fileMenu->addAction(tr("&新增配置"), this, &MainWindow::addDevice);
+    // addDevice 现带 groupPath 参数（triggered(bool) 的 bool 转不成 QString），
+    // 菜单入口用 lambda 传默认值（= 不落组）。
+    QAction *addDev = fileMenu->addAction(tr("&新增配置"), this,
+                                          [this] { addDevice(); });
     addDev->setShortcut(QKeySequence(QStringLiteral("Shift+Ctrl+A")));   // 新增配置
     addDev->setStatusTip(tr("添加配置"));
     QAction *addTun = fileMenu->addAction(tr("&新增SSH隧道"), this, &MainWindow::addTunnel);
@@ -1866,7 +1869,7 @@ QList<ProxyDeviceItem> proxyDeviceCatalog(const DeviceConfigStore &store)
 
 } // namespace
 
-void MainWindow::addDevice()
+void MainWindow::addDevice(const QString &groupPath)
 {
     AddDeviceDialog dlg(this);
     // 测试连接用：新建设备密码就在表单里，这个回调通常返回空，仅为统一接口。
@@ -1888,6 +1891,11 @@ void MainWindow::addDevice()
     // 新建设备：dlg.device() 已在构造时分配好 id，密码随条目带进来，
     // addDevice 负责把它搬进密码表（代理口令同办，见其实现）。
     m_store.addDevice(dlg.device());
+    // 右键分组"添加配置"带过来的目标分组：设备直接落进去，而不是进"未分组"。
+    // 空串与 kUngrouped 哨兵（右键"未分组"节点）都表示不落组；
+    // moveDeviceToGroup 对这两者以及不存在的路径本就直接忽略。
+    if (!groupPath.isEmpty())
+        m_groups.moveDeviceToGroup(dlg.device().name, groupPath);
     refreshDeviceList();
     saveDevices();
 }
@@ -1928,6 +1936,10 @@ void MainWindow::editDevice(const QString &name)
     // Name may have changed: remove the old key, insert the new.
     m_store.removeDevice(name);
     m_store.addDevice(edited);
+    // 改名必须把分组映射一并搬过去：groups.json 的 device_group_map 按设备名
+    // 做键，漏了这步新名字查不到映射，设备保存后就从原分组掉回"未分组"。
+    if (edited.name != name)
+        m_groups.onDeviceRenamed(name, edited.name);
     // 只有用户真的动过密码框才覆盖。空密码框是「没改」而不是「清空」，
     // 照单全收会让人一改端口就把密码丢了。
     if (dlg.passwordEdited())
@@ -1969,6 +1981,9 @@ void MainWindow::removeDevice(const QStringList &names)
         if (const DeviceEntry *e = m_store.find(name))
             m_store.forgetSecrets(e->id);
         m_store.removeDevice(name);
+        // 分组映射同步清掉：悬空键留着，将来同名的**新**设备会被静默归进
+        // 旧分组，没人能解释它为什么在那儿。
+        m_groups.onDeviceDeleted(name);
     }
     // 刷新与落盘在循环外只做一次：refreshDeviceList 会重发跳板机快照、
     // saveDevices 会写 JSON + 钥匙串，塞进循环就是 N 倍开销和 N 次失败弹窗。

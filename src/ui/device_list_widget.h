@@ -64,7 +64,9 @@ signals:
     // User clicked the "local terminal" button.
     void localTerminalRequested();
     // CRUD requests (handled by the main window, which owns the store).
-    void addRequested();
+    // "添加配置"：groupPath = 右键所在分组的完整路径，新设备应直接落进该分组；
+    // 空白处发起时为空串（= 不落组，进"未分组"）。
+    void addRequested(const QString &groupPath);
     void editRequested(const QString &name);
     // 批量：删除作用于整个选区，单选时就是一个元素的列表。
     void removeRequested(const QStringList &names);

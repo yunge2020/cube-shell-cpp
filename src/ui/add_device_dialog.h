@@ -151,11 +151,19 @@ private:
     // 从而可以安全地换成新协议的默认端口（用户手填过的端口不动）。
     QString m_portDefaultFor;
 
+    // 用户名框同理：SSH 默认填 root（其余协议没有惯例默认值，留空）。
+    // 语义与 m_portDefaultFor 完全一致——切协议时据此判断"用户没动过用户名"。
+    QString m_usernameDefaultFor;
+
     // 编辑态：钥匙串里已有密码 / 用户动过密码框。见 passwordEdited() 的说明。
     bool m_hasStoredPassword = false;
     bool m_passwordEdited = false;
     // 正在编辑的条目 id。新建设备时为空，由 device() 现分配。
     QString m_id;
+
+    // 正在编辑条目的创建时间（新建设备为 0）。device() 据此决定是打新戳
+    // 还是原样带回——设备在分组里的排序靠它，编辑不能挪位。
+    qint64 m_createdAt = 0;
 
 #ifdef CUBESHELL_WITH_RDP
     // RDP 专用控件。对应Python: _inject_protocol_fields（cube-shell.py:5989-6084）

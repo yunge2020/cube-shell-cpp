@@ -63,6 +63,13 @@ struct DeviceEntry {
     // 空串表示「尚未分配」——旧配置文件读进来就是这样，由迁移补齐。
     QString id;
 
+    // 创建时间（毫秒纪元）。设备在各分组里的展示顺序就是它——后创建的排
+    // 后面（分组本身的顺序沿用 groups.json 的声明序，同为创建序）。
+    // 0 = 旧版本条目没有这个字段：固定垫在最前面按名字排，且编辑时**不补**
+    // 时间戳（改个端口不该让设备在列表里挪位）。落盘/取值见 devices() 与
+    // toJsonArray 的 deviceDisplayOrderLess。
+    qint64 createdAt = 0;
+
     QString name;
     QString username;
     // 明文密码，**仅存在于内存**，绝不写进 devices.json（迁移完成后）。
@@ -151,7 +158,10 @@ public:
     // Load devices previously saved as JSON.
     bool loadJson(const QString &jsonPath, QString *errorOut = nullptr);
 
-    QList<DeviceEntry> devices() const { return m_devices.values(); }
+    // 全部设备，按创建顺序排序（createdAt 升序；旧版无时间戳的条目按名字
+    // 垫前，比较规则见 DeviceConfigStore.cpp 的 deviceDisplayOrderLess）。
+    // 设备树按这个顺序渲染——后创建的排后面。
+    QList<DeviceEntry> devices() const;
 
     // 存一个条目。id 为空时自动分配（兜底——正常路径由对话框在构造时就赋好）。
     //

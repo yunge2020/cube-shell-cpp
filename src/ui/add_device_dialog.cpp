@@ -2,6 +2,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFormLayout>
@@ -33,6 +34,15 @@ namespace cubeshell {
 // 设成 Ignored，就能把它们从那个 max 里摘掉。横向刻意不动：横向也 Ignored 的话，
 // 最宽的那页（私钥文件行还带个「浏览…」按钮）不再参与宽度计算，切到私钥页时
 // 对话框会突然变宽。
+
+// 用户名默认值：SSH 的惯例是 root，其余协议没有惯例默认（返回空串）。
+// 与 DeviceConfigStore::defaultPortFor() 同一设计——切协议时给字段一个
+// 合理初值，判定"用户没动过"的逻辑在 onProtocolChanged 里。
+static QString defaultUsernameFor(const QString &protocol)
+{
+    return protocol == QLatin1String("ssh") ? QStringLiteral("root") : QString();
+}
+
 static void fitStackToCurrentPage(QStackedWidget *stack)
 {
     if (!stack)
@@ -342,6 +352,8 @@ AddDeviceDialog::AddDeviceDialog(QWidget *parent)
 void AddDeviceDialog::setDevice(const DeviceEntry &e)
 {
     m_id = e.id;   // 编辑既有条目：id 必须原样带回，它是钥匙串的索引
+    // 创建时间同理由 device() 原样带回——它决定设备在分组里的排序。
+    m_createdAt = e.createdAt;
     // 先回填协议再填 host/port，避免 onProtocolChanged 覆盖实际端口。
     // 对应Python: set_protocol（cube-shell.py:6086-6088）+ domain/auth 回填
     // isSsh() 兜住 protocol 为空的旧配置。
@@ -385,6 +397,8 @@ void AddDeviceDialog::setDevice(const DeviceEntry &e)
     // 回填过实际端口后，端口框里就不再是"某协议的默认值"了——切协议时
     // 不该把用户存的端口冲掉。
     m_portDefaultFor.clear();
+    // 用户名同理：回填的是设备自己的用户名，不算任何协议的默认值。
+    m_usernameDefaultFor.clear();
     if (e.usesAgent()) {
         m_authMethod->setCurrentIndex(2);
         m_agentForward->setChecked(e.agentForwarding);
@@ -541,6 +555,10 @@ DeviceEntry AddDeviceDialog::device() const
     // RDP / SSH-密钥），放到末尾会让 5 个协议里的 3 个拿到空 id，
     // 密码就存不进钥匙串了。
     e.id = m_id.isEmpty() ? DeviceConfigStore::newDeviceId() : m_id;
+    // 创建时间与 id 同一套条件：新条目现场打戳（分组内按创建序展示）；
+    // 编辑既有条目原样带回 setDevice 存下的那份。旧版条目是 0，编辑后仍是
+    // 0——此刻补戳会让它从垫底区跳到列表末尾，改个端口就挪位没人能料到。
+    e.createdAt = m_id.isEmpty() ? QDateTime::currentMSecsSinceEpoch() : m_createdAt;
     e.name = m_name->text().trimmed();
 #ifdef CUBESHELL_WITH_SERIAL
     if (serialSelected()) {
@@ -763,6 +781,22 @@ void AddDeviceDialog::onProtocolChanged(int /*index*/)
         if (untouched) {
             m_port->setText(QString::number(defaultPortFor(proto)));
             m_portDefaultFor = proto;
+        }
+    }
+
+    // 用户名默认值同理：SSH 惯例 root，其余协议没有惯例默认（空）。
+    // 只在框为空、或里面还是上一个协议的默认值时才换——用户手填过的用户名
+    // 不动（比如 RDP 下填了域账号，切回 SSH 原样保留）。判定记录在
+    // m_usernameDefaultFor，与 m_portDefaultFor 同一设计。
+    {
+        const QString cur = m_username->text().trimmed();
+        const bool untouched =
+            cur.isEmpty()
+            || (!m_usernameDefaultFor.isEmpty() && cur == m_usernameDefaultFor);
+        if (untouched) {
+            const QString def = defaultUsernameFor(proto);
+            m_username->setText(def);
+            m_usernameDefaultFor = def;
         }
     }
 

@@ -35,6 +35,12 @@ static void testParseFormat()
 
 static void testCrudRoundTrip()
 {
+    // 夹具缺失时直接跳过而不是往下走：后面的 find() 会拿到 nullptr，
+    // 对它解引用就是段错误（夹具只存在于开发机的 /tmp 下）。
+    if (!QFile::exists(QStringLiteral("/tmp/cubeshell_test/config_p4.dat"))) {
+        qWarning() << "SKIP: missing fixture /tmp/cubeshell_test/config_p4.dat";
+        return;
+    }
     DeviceConfigStore store;
     CHECK(store.load(QStringLiteral("/tmp/cubeshell_test/config_p4.dat")));
     const int base = store.count();
@@ -101,11 +107,49 @@ static void testCrudRoundTrip()
     CHECK(raw.contains("\"id\""));
 }
 
+// 分组内展示顺序：按创建时间升序，后创建的排后面；旧版无时间戳（0）的
+// 条目垫在最前面按名字排。落盘往返后顺序不变。
+static void testCreationOrder()
+{
+    DeviceConfigStore store;
+    const auto add = [&store](const QString &name, qint64 createdAt) {
+        DeviceEntry e;
+        e.name = name;
+        e.createdAt = createdAt;
+        e.host = formatHostPort(QStringLiteral("10.0.0.1"), 22);
+        store.addDevice(e);
+    };
+    // 插入顺序与创建时间刻意错开：排序看的是 createdAt，不是 QHash 的插入序。
+    add(QStringLiteral("zz"), 2000);
+    add(QStringLiteral("aa"), 1000);
+    add(QStringLiteral("mm"), 0);   // 旧版条目：无时间戳
+    add(QStringLiteral("bb"), 0);
+
+    const QList<DeviceEntry> devs = store.devices();
+    CHECK(devs.size() == 4);
+    // 旧版条目（0）垫前，同组之间按名字排；时间升序在后。
+    CHECK(devs[0].name == QStringLiteral("bb"));
+    CHECK(devs[1].name == QStringLiteral("mm"));
+    CHECK(devs[2].name == QStringLiteral("aa"));
+    CHECK(devs[3].name == QStringLiteral("zz"));
+
+    // 保存 + 重载：createdAt 随 JSON 带走，顺序跨启动稳定。
+    const QString jsonPath = QDir::temp().filePath(QStringLiteral("cubeshell_order.json"));
+    CHECK(store.saveJson(jsonPath));
+    DeviceConfigStore reloaded;
+    CHECK(reloaded.loadJson(jsonPath));
+    const QList<DeviceEntry> again = reloaded.devices();
+    CHECK(again.size() == 4);
+    for (int i = 0; i < again.size(); ++i)
+        CHECK(again[i].name == devs[i].name);
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
     testParseFormat();
     testCrudRoundTrip();
+    testCreationOrder();
     qInfo() << (failures == 0 ? "ALL PASS" : "FAILURES") << failures;
     return failures == 0 ? 0 : 1;
 }

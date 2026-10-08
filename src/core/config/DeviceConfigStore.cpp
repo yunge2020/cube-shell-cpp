@@ -2,6 +2,8 @@
 
 #include "DeviceConfigStore.h"
 
+#include <algorithm>
+
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -36,6 +38,16 @@ SshCredentialKind sshCredentialKindFromString(const QString &s, SshCredentialKin
         return SshCredentialKind::SshAgent;
     if (s == QLatin1String("keyboardInteractive")) return SshCredentialKind::KeyboardInteractive;
     return fallback;
+}
+
+// 设备展示顺序：createdAt 升序（后创建的排后面）。时间相同（旧版条目恒为
+// 0、或同一毫秒内的批量导入）时按名字排——底下的 m_devices 是 QHash，本身
+// 没有稳定顺序，展示与落盘都必须先过这道排序，否则每次启动列表都会洗牌。
+static bool deviceDisplayOrderLess(const DeviceEntry &a, const DeviceEntry &b)
+{
+    if (a.createdAt != b.createdAt)
+        return a.createdAt < b.createdAt;
+    return a.name.localeAwareCompare(b.name) < 0;
 }
 
 HostPort parseHostPort(const QString &hostStr, quint16 defaultPort)
@@ -207,6 +219,13 @@ void DeviceConfigStore::addDevice(const DeviceEntry &entry)
         m_secrets.insert(proxySecretKey(e.id), e.proxy.password);
     e.proxy.password.clear();
     m_devices.insert(e.name, e);
+}
+
+QList<DeviceEntry> DeviceConfigStore::devices() const
+{
+    QList<DeviceEntry> out = m_devices.values();
+    std::sort(out.begin(), out.end(), deviceDisplayOrderLess);
+    return out;
 }
 
 DeviceEntry DeviceConfigStore::resolved(const QString &name) const
@@ -432,11 +451,19 @@ bool DeviceConfigStore::load(const QString &configDatPath, QString *errorOut)
 
 QJsonArray DeviceConfigStore::toJsonArray(bool withSecrets, bool withIds) const
 {
+    // 落盘顺序即展示顺序（创建序，见 deviceDisplayOrderLess），而不是 QHash
+    // 的任意顺序：文件在两次实际变更之间保持字节稳定，导出文件也把创建
+    // 顺序原样带给导入方。
+    QList<DeviceEntry> ordered = m_devices.values();
+    std::sort(ordered.begin(), ordered.end(), deviceDisplayOrderLess);
     QJsonArray arr;
-    for (const DeviceEntry &e : m_devices) {
+    for (const DeviceEntry &e : ordered) {
         QJsonObject o;
         if (withIds)
             o[QStringLiteral("id")]   = e.id;
+        // 创建时间。0（旧版条目）不写——读端缺键回落 0，两边语义一致。
+        if (e.createdAt > 0)
+            o[QStringLiteral("createdAt")] = e.createdAt;
         o[QStringLiteral("name")]     = e.name;
         o[QStringLiteral("username")] = e.username;
         // 密码只在迁移窗口期内写（inlinePasswords()），迁移完成后这一行不再执行。
@@ -521,6 +548,8 @@ bool DeviceConfigStore::loadJson(const QString &jsonPath, QString *errorOut)
         const QJsonObject o = v.toObject();
         DeviceEntry e;
         e.id       = o[QStringLiteral("id")].toString();
+        // 创建时间。缺键（旧版条目）回落 0——排序时垫在最前面按名字排。
+        e.createdAt = o[QStringLiteral("createdAt")].toInteger();
         e.name     = o[QStringLiteral("name")].toString();
         e.username = o[QStringLiteral("username")].toString();
         e.host     = o[QStringLiteral("host")].toString();

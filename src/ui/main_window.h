@@ -10,6 +10,7 @@
 #include <functional>
 
 #include "config/DeviceConfigStore.h"
+#include "config/GroupManager.h"
 // ChatMode 用于槽签名、AiCommand 用于待确认命令缓存 — 均需完整类型。
 #include "ai/AiChatPanel.h"
 
@@ -140,7 +141,9 @@ private:
     // 切换某个标签页的连接状态圆点颜色。
     void setTabConnected(QWidget *page, bool connected);
 
-    void addDevice();
+    // 新建设备。groupPath 非空 = 设备列表右键分组"添加配置"带过来的目标分组，
+    // 保存后直接落进该分组；空串 = 菜单/空白处入口，落"未分组"。
+    void addDevice(const QString &groupPath = QString());
     void editDevice(const QString &name);
     void removeDevice(const QStringList &names);
     void exportDevices();
@@ -418,6 +421,7 @@ private:
     bool m_leftBrowserSized = false;   // 首次展开时才设左栏上下比例
 
     DeviceConfigStore m_store;
+    GroupManager m_groups;   // groups.json：右键分组"添加配置"时把新设备落进对应分组
     QString m_configPath;   // where the pickle was loaded from (informational)
     QString m_jsonPath;     // where devices are saved (JSON, forward format)
 

@@ -289,12 +289,14 @@ void DeviceListWidget::onContextMenu(const QPoint &pos)
             }
             menu.addSeparator();
         }
-        menu.addAction(tr("添加配置"), this, &DeviceListWidget::addRequested);
+        // 带上分组路径：新配置直接落进右键的分组（"未分组"节点传哨兵，
+        // moveDeviceToGroup 对它本来就是 no-op）。
+        menu.addAction(tr("添加配置"), this, [this, path]() { emit addRequested(path); });
         // createGroup 带 QString 默认参数，成员指针与 triggered(bool) 不匹配，需用 lambda 收敛。
         menu.addAction(tr("新建分组"), this, [this] { createGroup(); });
     } else {
-        // 空白区域：新建分组 / 新建设备 / 本机终端 / 保存
-        menu.addAction(tr("添加配置"), this, &DeviceListWidget::addRequested);
+        // 空白区域：新建分组 / 新建设备 / 本机终端 / 保存（无分组语境，传空串）
+        menu.addAction(tr("添加配置"), this, [this]() { emit addRequested(QString()); });
         menu.addAction(tr("新建分组"), this, [this] { createGroup(); });
         menu.addSeparator();
 #ifdef CUBESHELL_WITH_LOCALPTY
