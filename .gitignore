@@ -190,3 +190,6 @@ coverage/
 *.pem
 *.key
 !resources/**/*.key
+
+# 本地 vcpkg 工具目录（README 的克隆步骤产物，含 downloads/buildtrees，巨大且可重建）
+/vcpkg/
